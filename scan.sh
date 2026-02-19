@@ -21,22 +21,33 @@ on_error() {
 }
 trap on_error ERR
 
-# === Parse arguments ==
+# Parse arguments
 SCANTYPE=""
 PAPERLESS=""
-while getopts "sdfp" opt; do
+EXP_PAGES=-1
+BREAK_PAGES=-1
+while getopts "sdfpn:b:" opt; do
     case "$opt" in
 	s) SCANTYPE="simplex" ;;
 	d) SCANTYPE="duplex" ;;
 	f) SCANTYPE="flatbed" ;;
         p) PAPERLESS="yes" ;;
+        n) EXP_PAGES=$OPTARG ;;
+        b) BREAK_PAGES=$OPTARG ;;
     esac
 done
+
+# Check input
+if ! [[ $EXP_PAGES =~ ^[0-9]+$ ]]; then
+  echo "the argument for flag -n must be a number!"
+  exit 1;
+fi
 
 # Configuration
 OUTPUT_DIR="$HOME/scans"
 BASENAME="scan_$(date +%Y%m%d_%H%M%S)"
-FINAL_PDF="$OUTPUT_DIR/${BASENAME}.pdf"
+TMP_FINAL_PDF="${tmpdir}/${BASENAME}.pdf"
+FINAL_PDF="${OUTPUT_DIR}/${BASENAME}.pdf"
 PAPERLESS_CONSUME_DIR=/home/max/docker-binds/paperless/consume
 RESOLUTION=300
 DEVICE="escl:http://192.168.1.65:80" # leave empty for default scanner, or set device name (airscan -L)
@@ -75,6 +86,11 @@ wait_for_button_exit() {
     echo
 }
 
+get_pdf_pages() {
+    #pdftk "$1" dump_data | grep NumberOfPages | awk '{print $2}'
+    pdfinfo "$1" | awk '/Pages:/ {print $2}'
+}
+
 scan_adf_pdf() {
     local outfile="$1"
 
@@ -84,6 +100,54 @@ scan_adf_pdf() {
         --resolution "$RESOLUTION" \
         --format=pdf \
         --batch="$outfile" --batch-print
+    
+    pages=$(get_pdf_pages "$outfile")
+}
+
+scan_adf_pdf_wrapper() {
+    local outfile="$1"
+    
+    while true; do
+        wait_for_button
+        echo "Scanning pages..."
+        scan_adf_pdf "$outfile"
+        if (( pages == EXP_PAGES )); then
+            echo "✅ Scanned $pages pages."
+            break
+        else
+            echo "⚠️ Warning: Expected page count not matched (${pages} vs. ${EXP_PAGES})."
+            echo "➡️ Repeat scan now."
+            echo ""
+        fi
+    done
+}
+
+break_pdf_pages()  {
+  local infile="$1"
+  local totpages=$(get_pdf_pages "$infile")
+  outfiles=()
+
+  for i in $(seq 1 ${BREAK_PAGES} $totpages); do 
+      # create range for pdftk
+      startpage=$i
+      endpage=$((i+BREAK_PAGES-1))
+  
+      # handle situation that total pages is not a multiple of BREAK_PAGES
+      if (( endpage > totpages )); then
+  	echo
+  	echo "⚠️ Warning: PDF pages are not m multiple of ${BREAK_PAGES}. Last PDF will be shorter."
+          endpage=$totpages;
+      fi 
+  
+      # run pdftk
+      output="${infile%.pdf}-${startpage}-${endpage}.pdf"
+      outfiles+=("$output")
+      pdftk $infile cat $startpage-$endpage output $output
+
+  done
+  
+  echo "✅ Split into ${#outfiles[@]} files." 
+
 }
 
 scan_flatbed_pdf() {
@@ -97,15 +161,15 @@ scan_flatbed_pdf() {
         > "$outfile"
 }
 
-#ask_duplex
+# Ask duplex vs simplex
 [[ -z "$SCANTYPE" ]] && ask_scan_type
 
 # Simplex workflow
 if [[ "$SCANTYPE" == "simplex" ]]; then
     wait_for_button
     echo "Scanning simplex document..."
-    scan_adf_pdf "$FINAL_PDF"
-    echo "✅ Simplex scan complete: $FINAL_PDF"
+    scan_adf_pdf "$TMP_FINAL_PDF"
+    echo "✅ Simplex scan complete: $TMP_FINAL_PDF"
 fi
 
 # Duplex workflow
@@ -114,21 +178,17 @@ if [[ "$SCANTYPE" == "duplex" ]]; then
     EVEN_PDF="${tmpdir}/even.pdf"
     
     echo "Load documents for ODD pages."
-    wait_for_button
-    echo "Scanning odd pages..."
-    scan_adf_pdf "$ODD_PDF"
-    
-    echo
-    echo "Now reinsert pages for EVEN pages (typically flipped)."
-    wait_for_button
-    echo "Scanning even pages..."
-    scan_adf_pdf "$EVEN_PDF"
+    scan_adf_pdf_wrapper "$ODD_PDF"
+    pagesodd=$pages
 
-    pagesodd=$(pdfinfo ${ODD_PDF}  | awk '/Pages:/ {print $2}')
-    pageseven=$(pdfinfo ${EVEN_PDF} | awk '/Pages:/ {print $2}')
+    echo
+    echo "Now reinsert pages for EVEN pages (flip stack upside down)."
+    scan_adf_pdf_wrapper "$EVEN_PDF"
+    pageseven=$pages
+
     if (( pagesodd != pageseven )); then
 	echo
-	echo "⚠️ Warning: Odd and even page counts do not match (${pagesodd} vs. ${pageseven})! ADF issue?"
+	echo "⚠️ Warning: Odd and even page counts do not match (${pagesodd} vs. ${pageseven})! This may be an ADF issue."
     fi
 
     echo
@@ -138,9 +198,9 @@ if [[ "$SCANTYPE" == "duplex" ]]; then
         A="$ODD_PDF" \
         B="$EVEN_PDF" \
         shuffle A Bend-1 \
-        output "$FINAL_PDF"
+        output "$TMP_FINAL_PDF"
     
-    echo "✅ Duplex scan complete: $FINAL_PDF"
+    echo "✅ Duplex scan complete: $TMP_FINAL_PDF"
 fi
 
 # Flatbed workflow
@@ -169,15 +229,34 @@ if [[ "$SCANTYPE" == "flatbed" ]]; then
     pdftk \
 	$PDF_PAGES \
         cat \
-        output "$FINAL_PDF"
+        output "$TMP_FINAL_PDF"
 
-    echo "✅ Flatbed scan complete: $FINAL_PDF"
+    echo "✅ Flatbed scan complete: $TMP_FINAL_PDF"
 fi
 
-[[ -z "$PAPERLESS" ]] && ask_paperless
+# Break final pdf into chunks
+if (( BREAK_PAGES > 0 )); then
+  echo ""
+  echo "Splitting PDF up..."
+  break_pdf_pages "$TMP_FINAL_PDF"
+  FINAL_PDF_FILES=()
+  for f in "${outfiles[@]}"; do
+    newf="${OUTPUT_DIR}/${f##*/}"
+    mv "$f" "$newf"
+    FINAL_PDF_FILES+=("$newf")
+  done
+else
+  mv "$TMP_FINAL_PDF" "$FINAL_PDF"
+  FINAL_PDF_FILES=("$FINAL_PDF")
+fi
+
+echo ""
+echo "Final file(s): ${FINAL_PDF_FILES[@]}"
 
 # Push to paperless consume dir
+echo ""
+[[ -z "$PAPERLESS" ]] && ask_paperless
 if [[ "$PAPERLESS" == "yes" ]]; then
-    mv "$FINAL_PDF" "$PAPERLESS_CONSUME_DIR"
-    echo "💾 Moved $FINAL_PDF to $PAPERLESS_CONSUME_DIR"
+    mv "${FINAL_PDF_FILES[@]}" "$PAPERLESS_CONSUME_DIR"
+    echo "💾 Moved ${FINAL_PDF_FILES[@]} to $PAPERLESS_CONSUME_DIR"
 fi
