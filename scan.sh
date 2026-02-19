@@ -251,12 +251,12 @@ else
 fi
 
 echo ""
-echo "Final file(s): ${FINAL_PDF_FILES[@]}"
+echo "🏁 Final file(s): ${FINAL_PDF_FILES[@]}"
 
 # Push to paperless consume dir
 echo ""
 [[ -z "$PAPERLESS" ]] && ask_paperless
 if [[ "$PAPERLESS" == "yes" ]]; then
     mv "${FINAL_PDF_FILES[@]}" "$PAPERLESS_CONSUME_DIR"
-    echo "💾 Moved ${FINAL_PDF_FILES[@]} to $PAPERLESS_CONSUME_DIR"
+    echo "💾 Moved file(s) to $PAPERLESS_CONSUME_DIR"
 fi
