@@ -62,7 +62,7 @@ Examples:
   $(basename "$0") -d -n 10 -o     Duplex, expect 10 pages, auto-rotate
   $(basename "$0") -f -b 2 -p      Flatbed, split every 2 pages, send to Paperless
 
-Output: ~/scans/scan_YYYYMMDD_HHMMSS.pdf  |  Resolution: 300 dpi
+Output: ~/scans/scan_YYYYMMDD_HHMMSS.pdf
 EOF
 }
 
