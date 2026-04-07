@@ -22,7 +22,7 @@ FINAL_PDF="${OUTPUT_DIR}/${BASENAME}.pdf"
 PAPERLESS_CONSUME_DIR=/home/max/docker-binds/paperless/consume
 RESOLUTION=300
 DEVICE="escl:http://192.168.1.232:80" # leave empty for default scanner, or set device name (run airscan -L and/or airscan-discover)
-MODE="lineart"
+MODE="gray"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -152,6 +152,10 @@ wait_for_button_exit() {
 
 get_mode() {
     if [[ $MODE == "lineart" ]] ||  [[ $MODE == "l" ]]; then
+        if [[ $SCANTYPE != "flatbed" ]]; then
+          echo "Scan mode \"$MODE\" and scan type \"$SCANTYPE\" are incompatible!"
+          exit 1;
+        fi
         MODE="Lineart"
     elif [[ $MODE == "gray" ]] ||  [[ $MODE == "g" ]]; then
         MODE="Gray"
