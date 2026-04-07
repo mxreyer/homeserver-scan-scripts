@@ -9,7 +9,22 @@
 set -euo pipefail # exit on error, undef vars, or failed pipeline
 set -o errtrace   # inherit ERR trap by functions, command subs, subshells 
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/venv/bin/activate"
+
 tmpdir=$(mktemp -d)
+
+# Configuration
+OUTPUT_DIR="$HOME/scans"
+BASENAME="scan_$(date +%Y%m%d_%H%M%S)"
+TMP_FINAL_PDF="${tmpdir}/${BASENAME}.pdf"
+FINAL_PDF="${OUTPUT_DIR}/${BASENAME}.pdf"
+PAPERLESS_CONSUME_DIR=/home/max/docker-binds/paperless/consume
+RESOLUTION=300
+DEVICE="escl:http://192.168.1.232:80" # leave empty for default scanner, or set device name (run airscan -L and/or airscan-discover)
+MODE="lineart"
+
+mkdir -p "$OUTPUT_DIR"
 
 on_exit() {
     rm -r "$tmpdir"
@@ -21,38 +36,87 @@ on_error() {
 }
 trap on_error ERR
 
+show_help() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [--KEY=VALUE ...]
+Scan documents from a network scanner to PDF.
+
+Scan type (mutually exclusive — prompted if omitted):
+  -s                Simplex (one-sided ADF)
+  -d                Duplex (two-sided ADF; scan odd pages then even, auto-merged)
+  -f                Flatbed (page-by-page; press s when done)
+
+Options:
+  -n NUM            Expected page count (warn and retry if scan doesn't match)
+  -b NUM            Split output into chunks of NUM pages each
+  -o                Check and fix text orientation (auto-rotate pages)
+  -p                Move final PDF(s) to Paperless consume dir without prompting
+  -r                Scan resolution in dpi.
+  -m                Scan mode c[olor]/g[rayscale]/l[ineart].
+  -i                Show printer-specific scanimage help message and exit
+  -h                Show this help message and exit
+  [--KEY=VALUE ...] Extra options passed directly to scanimage (e.g. --brightness=50)
+
+Examples:
+  $(basename "$0") -s -p            Simplex scan, send to Paperless
+  $(basename "$0") -d -n 10 -o     Duplex, expect 10 pages, auto-rotate
+  $(basename "$0") -f -b 2 -p      Flatbed, split every 2 pages, send to Paperless
+
+Output: ~/scans/scan_YYYYMMDD_HHMMSS.pdf  |  Resolution: 300 dpi
+EOF
+}
+
+show_printer_help() {
+    scanimage ${DEVICE:+--device-name "$DEVICE"} --help
+}
+
+
+# Separate --flag=value args from short -x args before getopts
+SCANIMAGE_EXTRA_ARGS=()
+FILTERED_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == --*=* ]]; then
+        SCANIMAGE_EXTRA_ARGS+=("$arg")
+        #tmparg="${arg%=*}=${arg#*=}"
+        #SCANIMAGE_EXTRA_ARGS+=("$tmparg")
+        #echo "$arg"
+    else
+        FILTERED_ARGS+=("$arg")
+    fi
+done
+set -- "${FILTERED_ARGS[@]}"
+
 # Parse arguments
 SCANTYPE=""
 PAPERLESS=""
+CHECK_TEXT_ORIENTATION="no"
 EXP_PAGES=-1
 BREAK_PAGES=-1
-while getopts "sdfpn:b:" opt; do
+while getopts "sdfpon:b:r:m:ih" opt; do
     case "$opt" in
 	s) SCANTYPE="simplex" ;;
 	d) SCANTYPE="duplex" ;;
 	f) SCANTYPE="flatbed" ;;
         p) PAPERLESS="yes" ;;
+        o) CHECK_TEXT_ORIENTATION="yes" ;;
         n) EXP_PAGES=$OPTARG ;;
         b) BREAK_PAGES=$OPTARG ;;
+        r) RESOLUTION=$OPTARG ;;
+        m) MODE=$OPTARG ;;
+        i) show_printer_help; exit 0 ;;
+        h) show_help; exit 0 ;;
     esac
 done
 
 # Check input
-if ! [[ $EXP_PAGES =~ ^[0-9]+$ ]]; then
+if ! [[ $EXP_PAGES =~ ^(-|)[0-9]+$ ]]; then
   echo "the argument for flag -n must be a number!"
   exit 1;
 fi
-
-# Configuration
-OUTPUT_DIR="$HOME/scans"
-BASENAME="scan_$(date +%Y%m%d_%H%M%S)"
-TMP_FINAL_PDF="${tmpdir}/${BASENAME}.pdf"
-FINAL_PDF="${OUTPUT_DIR}/${BASENAME}.pdf"
-PAPERLESS_CONSUME_DIR=/home/max/docker-binds/paperless/consume
-RESOLUTION=300
-DEVICE="escl:http://192.168.1.65:80" # leave empty for default scanner, or set device name (airscan -L)
-
-mkdir -p "$OUTPUT_DIR"
+if ! [[ $MODE =~ (c|g|l|color|gray|lineart) ]]; then
+  echo "the argument for flag -m must be one of the following: c[olor]/g[rayscale]/l[ineart]"
+  exit 1;
+fi
 
 ask_scan_type() {
     read -rp "Specify scan type (s[implex]/d[uplex]/f[latbed]): " scantype
@@ -86,6 +150,20 @@ wait_for_button_exit() {
     echo
 }
 
+get_mode() {
+    if [[ $MODE == "lineart" ]] ||  [[ $MODE == "l" ]]; then
+        MODE="Lineart"
+    elif [[ $MODE == "gray" ]] ||  [[ $MODE == "g" ]]; then
+        MODE="Gray"
+    elif [[ $MODE == "color" ]] ||  [[ $MODE == "c" ]]; then
+        MODE="Color"
+    else
+        echo "Invalid -m flag: ${MODE}!"
+        exit 1
+    fi
+    echo "Scan mode: ${MODE}"
+}
+
 get_pdf_pages() {
     #pdftk "$1" dump_data | grep NumberOfPages | awk '{print $2}'
     pdfinfo "$1" | awk '/Pages:/ {print $2}'
@@ -98,8 +176,10 @@ scan_adf_pdf() {
         ${DEVICE:+--device-name "$DEVICE"} \
         --source "Automatic Document Feeder(left aligned)" \
         --resolution "$RESOLUTION" \
+        --mode "$MODE" \
         --format=pdf \
-        --batch="$outfile" --batch-print
+        --batch="$outfile" --batch-print \
+        "${SCANIMAGE_EXTRA_ARGS[@]}"
     
     pages=$(get_pdf_pages "$outfile")
 }
@@ -111,7 +191,7 @@ scan_adf_pdf_wrapper() {
         wait_for_button
         echo "Scanning pages..."
         scan_adf_pdf "$outfile"
-        if (( pages == EXP_PAGES )); then
+        if (( pages == EXP_PAGES )) || (( EXP_PAGES == -1 )); then
             echo "✅ Scanned $pages pages."
             break
         else
@@ -157,9 +237,14 @@ scan_flatbed_pdf() {
         ${DEVICE:+--device-name "$DEVICE"} \
         --source "FlatBed" \
         --resolution "$RESOLUTION" \
+        --mode "$MODE" \
         --format=pdf \
+        "${SCANIMAGE_EXTRA_ARGS[@]}" \
         > "$outfile"
 }
+
+# parse color mode
+get_mode
 
 # Ask duplex vs simplex
 [[ -z "$SCANTYPE" ]] && ask_scan_type
@@ -252,6 +337,16 @@ fi
 
 echo ""
 echo "🏁 Final file(s): ${FINAL_PDF_FILES[@]}"
+
+# check text orientation, auto-rotate, and duplicate rotated pages, if necessary.
+if [[ "$CHECK_TEXT_ORIENTATION" == "yes" ]]; then
+    echo ""
+    echo "🔁 Check page orientations and rotate if necessary..."
+    for f in "${FINAL_PDF_FILES[@]}"; do
+        python3 "${SCRIPT_DIR}/check-text-orientation.py" -i "$f" -o "$f"
+    done
+    echo "✅ Done."
+fi
 
 # Push to paperless consume dir
 echo ""
